@@ -20,6 +20,8 @@
 </div>
 
 ## News
+2025.09.19 | Our work has been accepted to NeurIPS 2025 🎉
+
 2025.06.08 | Our work has been [reported by 机器之心](https://mp.weixin.qq.com/s/abUS_x8GTHEqTwS9rCwgLg)👏
 
 ## Overview
