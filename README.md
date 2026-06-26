@@ -72,6 +72,43 @@ Our framework consists of three components: ***Segment Partition***, ***Segment 
    bash scripts/download_and_prepare_dataset.sh
    ```
 
+## ⚠️ Before launching on the cluster — known failure & mandatory check (local)
+
+> Local note (not upstream). Our multi-GPU cluster runs use `scripts/sbatch_spo_tree_*.sh` →
+> `scripts/launch_server2_spo_multi.sh`, **not** the single-GPU `--include localhost:0` commands in the
+> Train section below. Full post-mortem: `exp_track.md` → "Root cause & fix #2".
+
+**Guidance LLM cache corruption (RESOLVED 2026-06-12).** treetune's guidance disk cache
+(`src/guidance/llms/caches/_diskcache.py`) is keyed only by the LLM **class** name, so by default
+**every rank of every job shares one SQLite DB** at `~/.cache/guidance/_openai_vllm.diskcache/cache.db`
+on the network home FS. SQLite's file locking is unreliable on network filesystems, so concurrent
+(multi-rank / multi-job) writers corrupt it:
+- `sqlite3.DatabaseError: database disk image is malformed` — on a cache **write**, mid-run, or
+- `sqlite3.DatabaseError: file is not a database` — on cache **open**, at iter 0.
+
+This killed two concurrent 8-GPU runs within 5 s of each other (7B job 1405148 at **iter 209 / ~11.75 h**;
+qwen job 1405981 at **iter 0**). Note: `no_cache: true` in the configs does **not** disable this cache.
+
+**Fix (already applied):**
+1. `_diskcache.py` honors a `GUIDANCE_CACHE_DIR` env var (falls back to the default when unset).
+2. Every `scripts/sbatch_spo_tree_*.sh` exports a **per-job, node-local** cache —
+   `GUIDANCE_CACHE_DIR=/dev/shm/guidance_cache_$SLURM_JOB_ID` (fallback per-job `$TMPDIR`), cleaned on exit.
+
+**Pre-launch checklist — verify EVERY time before `sbatch`:**
+- [ ] **Cache patch present:** `grep -q GUIDANCE_CACHE_DIR src/guidance/llms/caches/_diskcache.py`.
+      ⚠️ This is an uncommitted edit to vendored `guidance`; a fresh checkout / `git restore` reverts it,
+      after which the sbatch env var is **silently ignored** and the bug returns.
+- [ ] The sbatch sets a **per-job, node-local** guidance cache (`/dev/shm/...$SLURM_JOB_ID` or
+      `/tmp/...$SLURM_JOB_ID`) — never the default `~/.cache/guidance` on the network FS.
+      Check: `grep -nE "GUIDANCE_CACHE_(DIR|BASE)|XDG_CACHE_HOME" scripts/sbatch_spo_tree_*.sh`
+      (expect a `/dev/shm` base + a `guidance_cache_$SLURM_JOB_ID` dir).
+- [ ] Configs resolve and reference **local** model snapshots (offline-safe under `HF_HUB_OFFLINE=1`).
+- [ ] After the job starts, its log prints `GUIDANCE_CACHE_DIR=/dev/shm/...`, **and**
+      `grep -c "database disk image is malformed\|file is not a database" <log>` stays **0**.
+
+General lesson (any framework): SQLite-backed caches must be **node-local**, not merely off-`$HOME` —
+see `~/.llms/skills/ml-cluster-training-ops` §12.
+
 ## Train 🤖
 
 ### Rho-1.1B on GSM8K
