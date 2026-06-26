@@ -70,6 +70,13 @@ local math_validation_inference_pipeline =
     dataset_split: 'validation',
     dataset_portion: 1,
     inference_name: 'math_validation',
+    analyzers: [
+      (import 'analyzers/task_performance.jsonnet'),
+      (import 'analyzers/mean_at_k.jsonnet') + {
+        model_name_or_path: tokenizer.hf_model_name,
+        data_source: 'math_v2',
+      },
+    ],
   };
 
 local collegeMath_inference_pipeline =
@@ -102,8 +109,8 @@ local olympiadbench_test_inference_pipeline =
 
 {
   inference_pipelines: [
-    math_test_inference_pipeline,
-    // math_validation_inference_pipeline,
+    math_validation_inference_pipeline,
+    // math_test_inference_pipeline,
     // math_train_inference_pipeline,
     // collegeMath_test_inference_pipeline,
     // olympiadbench_test_inference_pipeline,

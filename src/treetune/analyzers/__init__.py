@@ -10,3 +10,4 @@ from .valnet_action_ranking_analyzer import ValNetActionRankingAnalyzer
 from .mc_value_action_ranking_analyzer import MCValueActionRankingAnalyzer
 from .restem_upload_chosen_checkpoint import RestemUploadChosenCheckpoint
 from .kl_with_reference_analyzer import KLWithReferenceAnalyzer
+from .mean_at_k_analyzer import MeanAtKAnalyzer
