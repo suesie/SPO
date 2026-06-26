@@ -288,7 +288,15 @@ class OnPolicyEpisodeGenerator(EpisodeGenerator):
                 or self.dataset_shuffle_before_portion
             )
             if do_shuffle:
-                dataset = dataset.shuffle(seed=self.seed + iteration)
+                # All ranks derive the same on-disk shuffle-cache name (dataset
+                # fingerprint + seed) and race on the write+os.chmod in the shared
+                # lustre-backed data/ dir, which killed iter 659 of job 1414137 with
+                # FileNotFoundError on cache-*.arrow. Shuffle purely in-memory instead.
+                dataset = dataset.shuffle(
+                    seed=self.seed + iteration,
+                    keep_in_memory=True,
+                    load_from_cache_file=False,
+                )
 
             dataset = dataset.select(range(num_samples))
 
