@@ -1,4 +1,7 @@
-local hf_model_name = 'deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B';
+// Local snapshot dir (NOT repo-ID): under HF_HUB_OFFLINE=1, vLLM 0.4 resolves a
+// repo-ID via a Hub API call that raises OfflineModeIsEnabled, crashing all
+// per-rank servers at iter-0 (see exp_track.md root-cause for the 7B run).
+local hf_model_name = '/lustre-storage/datasets/zengh/huggingface/hub/models--deepseek-ai--DeepSeek-R1-Distill-Qwen-1.5B/snapshots/ad9f0ae0864d7fbcd1cd905e3c6c5b069cc8b562';
 
 local math_task = (import 'tasks/math_inplace_no_answer_prefix.jsonnet') + {
   prepend_in_context_few_shot: false,

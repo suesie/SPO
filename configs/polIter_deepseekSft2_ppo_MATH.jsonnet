@@ -1,4 +1,10 @@
-local hf_model_name = 'realtreetune/deepseekmath-7b-sft-MATH-v2';
+// Local HF-cache snapshot path, NOT the repo-id. SPO's on_policy_episode_generator
+// passes initial_model_name_or_path straight to vLLM at iter 0, and vLLM 0.4.0 resolves
+// a repo-id via HfFileSystem.ls() (a Hub API call) which raises OfflineModeIsEnabled
+// under HF_HUB_OFFLINE=1. VinePPO's fork resolves the repo-id to this exact snapshot dir
+// before launching vLLM; SPO's fork does not, so we point at the local dir directly.
+// transformers from_pretrained() loads this local dir for actor/reference/tokenizer.
+local hf_model_name = '/lustre-storage/datasets/zengh/huggingface/hub/models--realtreetune--deepseekmath-7b-sft-MATH-v2/snapshots/8b387c255b3bfaaaef2e650d56fecfde1c56ea96';
 
 local actor_tokenizer = {
   type: 'pretrained',

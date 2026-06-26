@@ -3,7 +3,9 @@ local temperature = 0.35;
 
 local tokenizer = {
   type: 'pretrained',
-  hf_model_name: 'realtreetune/deepseekmath-7b-sft-MATH-v2',
+  // Local snapshot path, NOT repo-id (see polIter_deepseekSft2_ppo_MATH.jsonnet) — avoids
+  // any Hub call under HF_HUB_OFFLINE=1 for the in-loop eval tokenizer / mean_at_k analyzer.
+  hf_model_name: '/lustre-storage/datasets/zengh/huggingface/hub/models--realtreetune--deepseekmath-7b-sft-MATH-v2/snapshots/8b387c255b3bfaaaef2e650d56fecfde1c56ea96',
 };
 
 
