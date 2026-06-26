@@ -272,12 +272,13 @@ fabric.properties
 dataset/
 dumps/
 model_outputs/
-/data/
+/data
 
 /scripts/.launcher_config.json
 
 configs/.wandb_api_key.json
 /results/inference_results/
+/results/eval_*_seed42.json
 /cached_inference_results/
 temp_ppo_checkpoints
 tmp_ckpt*
