@@ -99,6 +99,8 @@ local sampling_temperature = 0.6;
   use_deepspeed: true,
 
   num_iterations: total_num_iterations,
+  // Run in-loop validation every 25 iterations to match grpocredit's test_freq=25.
+  evaluate_every_n_iterations: 25,
   num_episodes_per_iteration: num_episodes_per_iteration,
   episodes_cloud_log_steps: 50,
 
@@ -120,8 +122,10 @@ local sampling_temperature = 0.6;
       per_device_train_batch_size: 8,
       per_device_eval_batch_size: 2,
       gradient_accumulation_steps: null,
-      save_steps: 10,
-      checkpoint_keep_steps: 40,
+      save_steps: 25,
+      // NOT a count: retains every checkpoint whose iter % checkpoint_keep_steps == 0
+      // (modulus, see ppo_trainer.clean_checkpoints). =save_steps keeps 25,50,...,1000.
+      checkpoint_keep_steps: 25,
     },
   },
 

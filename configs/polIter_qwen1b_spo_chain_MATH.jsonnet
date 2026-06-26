@@ -49,7 +49,14 @@ local num_mc_rollouts = 4;
     },
 
     max_sequence_length: null,
-    max_question_length: 200,
+    // BUGFIX (local): upstream shipped 200, which is the GSM8K value (see
+    // polIter_qwen05b_spo_chain_gsm8k.jsonnet) carried over to MATH. It drops ~12% of
+    // MATH train (templated prompt >200 tok) since the ~85-tok instruction eats into the
+    // budget. Every other MATH config is larger: base default 1512
+    // (episode_generators/math_episode_generator.jsonnet), 7B inherits 1512,
+    // polIter_qwen1_5b_base_spo_chain_MATH.jsonnet uses 512. Set to 512 to match the base
+    // qwen-1.5B MATH config.
+    max_question_length: 512,
     question_sampler: {
       type: 'random',  // not used
     },
@@ -167,8 +174,12 @@ local num_mc_rollouts = 4;
       per_device_train_batch_size: 2,
       per_device_eval_batch_size: 2,
       gradient_accumulation_steps: null,  // Will be auto computed
-      save_steps: 5,
-      checkpoint_keep_steps: 10,
+      // Checkpoint at 25,50,...,1000 (match the 7B run's cadence).
+      // checkpoint_keep_steps is NOT a count: clean_checkpoints retains every
+      // checkpoint whose iter % checkpoint_keep_steps == 0 (modulus). With
+      // save_steps == checkpoint_keep_steps == 25 → keep iters 25,50,...,1000 (40 ckpts).
+      save_steps: 25,
+      checkpoint_keep_steps: 25,
     },
 
   },

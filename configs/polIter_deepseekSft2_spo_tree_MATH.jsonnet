@@ -3,7 +3,12 @@ local num_episodes_per_iteration = 1024;
 local num_dataset_samples_per_iteration = 16;
 local total_num_iterations = 1000;
 
-(import 'polIter_deepseekSft2_vineppo_MATH.jsonnet')
+// NOTE: upstream imported 'polIter_deepseekSft2_vineppo_MATH.jsonnet', which is NOT
+// shipped in the SPO release (the import fails) and, being VinePPO-based, lacks the
+// SPO probability-mask update. Repointed to the shipped, working SPO-chain base so
+// this is a genuine SPO-tree config (use_prob_mask=true), mirroring the structure of
+// polIter_qwen1b_spo_tree_MATH.jsonnet.
+(import 'polIter_deepseekSft2_spo_chain_MATH.jsonnet')
 + {
   episode_generator+: {
     type: 'hybrid_episode_generator',
