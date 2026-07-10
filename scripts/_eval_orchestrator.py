@@ -63,6 +63,18 @@ class RunSpec:
     tensor_parallel_size: int = 8
     gpu_memory_utilization: float = 0.85
     seed: int = 42
+    # Grader mode forwarded to _eval_one_ckpt.py --grader. DEFAULT "verl" keeps the
+    # original behavior/output unchanged (used by the DeepSeekMath-7B eval). Only the
+    # Qwen-1.5B orchestrator sets "both"/"math_verify" to add SPO's extractive_match.
+    grader: str = "verl"
+    mv_precision: int = 5
+    # vLLM stop strings forwarded to _eval_one_ckpt.py --stop.
+    #   None       -> don't pass --stop; worker keeps its default ["\n\n\nProblem:"]
+    #                 (correct for the DeepSeekMath-7B multi-problem SFT format).
+    #   []          -> disable stops entirely (pass `--stop ''`), matching SPO's
+    #                 lighteval custom|math_500 (stop_sequence=[]); used by the Qwen eval.
+    #   ["a","b"]   -> pass each as a --stop.
+    stop: Optional[list] = None
 
 
 def discover_checkpoints(root: Path) -> list[tuple[int, int, Path]]:
@@ -137,6 +149,17 @@ def run_one_eval(item: WorkItem, spec: RunSpec) -> dict:
         "--tensor-parallel-size", str(spec.tensor_parallel_size),
         "--gpu-memory-utilization", str(spec.gpu_memory_utilization),
     ]
+    # Only pass grader flags when opting out of the default 'verl', so the 7B eval's
+    # subprocess command (and everything downstream) is byte-identical to before.
+    if spec.grader != "verl":
+        cmd += ["--grader", spec.grader, "--mv-precision", str(spec.mv_precision)]
+    # Stop override. None (7B) -> no --stop flag, worker keeps its default. [] -> disable.
+    if spec.stop is not None:
+        if len(spec.stop) == 0:
+            cmd += ["--stop", ""]        # worker maps [""] -> stop=None (no custom stop)
+        else:
+            for s in spec.stop:
+                cmd += ["--stop", s]
     log.info("CMD: %s", " ".join(cmd))
     t0 = time.time()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -219,11 +242,20 @@ def run_orchestrator(spec: RunSpec, dry_run: bool = False) -> None:
         doc["evals"].append(result)
         doc["last_updated_utc"] = datetime.now(timezone.utc).isoformat()
         atomic_write_json(spec.out_json, doc)
-        log.info(
-            "  -> pass1=%.4f ± %.4f  pass@%d=%.4f  wall=%.0fs",
-            result["pass1"], result["ci95"], result["n_samples_per_question"],
-            result["pass_at_n"], result["wall_seconds"],
-        )
+        if "graders" in result:
+            gsummary = "  ".join(
+                f"{name}:pass1={s['pass1']:.4f}(pass@{result['n_samples_per_question']}={s['pass_at_n']:.4f})"
+                for name, s in result["graders"].items()
+            )
+            log.info("  -> [primary=%s] %s  wall=%.0fs",
+                     result.get("grader", "?"), gsummary, result["wall_seconds"])
+        else:
+            # Original single-grader (verl) log line — unchanged for the 7B eval.
+            log.info(
+                "  -> pass1=%.4f ± %.4f  pass@%d=%.4f  wall=%.0fs",
+                result["pass1"], result["ci95"], result["n_samples_per_question"],
+                result["pass_at_n"], result["wall_seconds"],
+            )
 
     log.info("============================================================")
     log.info("DONE. wrote %d total evals to %s", len(doc["evals"]), spec.out_json)

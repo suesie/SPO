@@ -380,16 +380,61 @@ Each orchestrator writes ONE consolidated JSON, appended atomically after every 
 `se_bernoulli` is reported alongside as the optimistic iid-sample formula. `ci95 = 1.96 *
 se_cluster` is the headline error bar.
 
+> **Schema status (verified 2026-07-09):** the record above is the **base schema** and is
+> **unchanged** — the DeepSeek 7B eval writes exactly these fields. The R1-Distill-Qwen-1.5B
+> orchestrator runs **dual-grader** (`--grader both`, see §13.3) and writes the same base fields
+> **plus** grader fields: `grader` (= primary = `math_verify`), `grader_mode` (= `"both"`),
+> `graders.{math_verify,verl}.{pass1,pass_at_n,se_cluster,se_bernoulli,ci95}`, `grader_configs`,
+> `mv_gold_extract_failures`, `mv_grade_errors`, `grade_seconds`. The top-level `pass1`/`pass_at_n`
+> mirror the **primary** (math_verify) grader; `graders.verl.*` carries the legacy number.
+
 ### 13.3 Launch
 
+**DeepSeek 7B** (verl grader; VoI/GRPO-comparable — byte-identical to the original harness):
 ```bash
 sbatch /home/zengh/projects/SPO/scripts/sbatch_eval_spo_deepseek7b.sh   # ~7h on 8×H200, 1d allocation
-sbatch /home/zengh/projects/SPO/scripts/sbatch_eval_spo_qwen1b.sh       # ~4h on 8×H200, 1d allocation
 ```
 
+**R1-Distill-Qwen-1.5B** — launcher **`scripts/sbatch_eval_spo_qwen1b.sh`** (SPO-published
+`extractive_match` parity):
+```bash
+sbatch /home/zengh/projects/SPO/scripts/sbatch_eval_spo_qwen1b.sh       # ~4h on 8×H200, 1d allocation
+```
+The Qwen launcher (1) ensures the R1-distill Qwen-templated parquets are current via the idempotent
+`build_qwen_templated_parquets.py` — gated by a `data/verl_qwen/.template_version` marker, so it
+rebuilds when missing/partial/**stale** (e.g. `bos-v1` parquets that erroneously embedded a literal
+leading-`<｜begin▁of▁sentence｜>` — vLLM already auto-prepends the BOS, so that doubled it; reverted
+in `nobos-v2`) and is a no-op otherwise — then (2) runs `python scripts/eval_spo_qwen1b.py`, which
+defaults to **`--grader both`**:
+- **PRIMARY = `math_verify`** — SPO's *published* `extractive_match` grader, i.e. open-r1's
+  `custom|math_500` config (`@ eeca246b`): gold=`(LatexExtractionConfig(),)`,
+  pred=`(ExprExtractionConfig(), LatexExtractionConfig(boxed_match_priority=0))`, `precision=5`,
+  `math_verify.verify`. The record's top-level `pass1`/`pass_at_n` are this grader.
+- **SECONDARY = `verl`** — Hendrycks `is_equiv`, recorded under `graders.verl` for continuity with
+  the VoI/GRPO comparison. (Alternatives: `--grader math_verify` = SPO only; `--grader verl` =
+  legacy. `math_verify` must be importable — the `grpocredit-verl-pinned` env has it.)
+
+This launcher realizes **exactly** the §13.1 protocol rows (columns `n / T / top_p / max_model_len /
+max_tokens / dataset / checkpoints`): MATH-500 (`math_v2`) n=16 @2K on **all 40 ckpts**; AIME-24
+n=32, OlympiadBench n=16, CollegeMath n=16 @2K on the **final 4**; and MATH-500 n=16 @4K on the
+**final 4** — all at T=0.6, top_p=0.95 (`build_work_list` == table lines 329–333, verified). Beyond
+those sampling params, the Qwen generation is now **token-identical** to SPO's lighteval
+(`--use-chat-template`, including the leading BOS — a single 151646, auto-prepended by vLLM's
+`add_special_tokens=True` default; the on-disk template does NOT embed a literal BOS) with the stop
+**disabled** (`stop_sequence=[]`),
+and the grader/extraction **config** is byte-for-byte SPO's (open-r1 targets + `precision=5`; the
+`math_verify` engine is 1:1 with lighteval's vendored parse/verify — see the caveat in
+`_math_verify_grader.py` re. the `latex2sympy2_extended` pin) — so the **MATH-500 @2K/@4K** numbers
+are directly comparable to SPO's published **0.736 / 0.828** (the only differences are mean@16 vs
+SPO's n=1 — same estimand, lower variance — and that this scores the *seed42 SPO-tree reproduction*,
+not the released checkpoint). The **4K** row IS a published SPO column (0.828); it is an
+"extrapolation" only relative to SPO's effective-2K *training* (§13.1). The **OOD slate**
+(AIME-24 / OlympiadBench / CollegeMath) is the only extra — not in SPO's published numbers. The 7B
+eval is unaffected (always verl).
+
 Outputs land at:
-- `SPO/results/eval_spo_deepseek7b_seed42.json` (52 evals: 40 MATH-500 + 12 OOD)
-- `SPO/results/eval_spo_qwen1b_seed42.json` (56 evals: 40 MATH-500@2K + 12 OOD@2K + 4 MATH-500@4K)
+- `SPO/results/eval_spo_deepseek7b_seed42.json` (52 evals: 40 MATH-500 + 12 OOD; verl grader, base §13.2 schema)
+- `SPO/results/eval_spo_qwen1b_seed42.json` (56 evals: 40 MATH-500@2K + 12 OOD@2K + 4 MATH-500@4K; dual-grader, base §13.2 + grader fields)
 
 **Restart-safe.** Each orchestrator appends to the consolidated JSON after each ckpt completes
 (atomic tmp + rename); on resubmit it parses the existing JSON, builds a set of done
@@ -400,12 +445,14 @@ on preempt / timeout / OOM.
 
 | File | Purpose |
 |---|---|
-| `scripts/_eval_one_ckpt.py` | Single-eval worker. Vendored from `grpocredit/scripts/eval_final_checkpoint.py`; adds `--max-model-len`; emits delimited JSON block on stdout for orchestrator capture. |
-| `scripts/_eval_orchestrator.py` | Shared orchestrator helpers (ckpt discovery, resume-skip, atomic JSON append). |
+| `scripts/_eval_one_ckpt.py` | Single-eval worker. Vendored from `grpocredit/scripts/eval_final_checkpoint.py`; adds `--max-model-len`; `--grader {verl(default),math_verify,both}` selects the grader (verl path unchanged; math_verify/both add SPO's extractive_match); emits delimited JSON block on stdout for orchestrator capture. |
+| `scripts/_eval_orchestrator.py` | Shared orchestrator helpers (ckpt discovery, resume-skip, atomic JSON append). `RunSpec.grader`/`mv_precision`/`stop` default to the original 7B behavior; only the Qwen orchestrator overrides them. |
+| `scripts/_math_verify_grader.py` | SPO's *published* `extractive_match` grader (open-r1 `custom|math_500` config: `math_verify` parse + `verify`, precision 5). Used only when `--grader math_verify`/`both`. |
+| `scripts/test_grader_parity.py` | Self-test for the math_verify grader (run in an env with `math_verify`, e.g. the reference `llmagent` env or `grpocredit-verl-pinned`). |
 | `scripts/_prepare_spo_ckpt_for_vllm.sh` | Symlinks tokenizer files from base-model snapshot into `<ckpt>/hf_pretrained/` (SPO ckpts only save weights+config, not tokenizer). Idempotent. |
-| `scripts/build_qwen_templated_parquets.py` | Rewrites grpocredit's 4 parquets with the R1-distill chat template → `SPO/data/verl_qwen/*.parquet`. Same rows, only `prompt[0].content` changes. |
-| `scripts/eval_spo_deepseek7b.py` | DeepSeek 7B orchestrator (52 work items). Reuses grpocredit's parquets directly (`[MATH_TASK] Problem:` template matches the 7B SFT base). |
-| `scripts/eval_spo_qwen1b.py` | Qwen 1.5B orchestrator (56 work items). Uses Qwen-templated parquets. |
+| `scripts/build_qwen_templated_parquets.py` | Rewrites grpocredit's 4 parquets with the R1-distill chat template (NO literal BOS — vLLM auto-prepends the single `<｜begin▁of▁sentence｜>` on encode) → `SPO/data/verl_qwen/*.parquet`. Same rows, only `prompt[0].content` changes. Idempotent (`.template_version` marker). |
+| `scripts/eval_spo_deepseek7b.py` | DeepSeek 7B orchestrator (52 work items). Reuses grpocredit's parquets directly (`[MATH_TASK] Problem:` template matches the 7B SFT base). verl grader; unchanged. |
+| `scripts/eval_spo_qwen1b.py` | Qwen 1.5B orchestrator (56 work items). Uses Qwen-templated parquets; defaults `--grader both` and disables the stop (`stop=[]`) to match SPO's lighteval. |
 | `scripts/sbatch_eval_spo_{deepseek7b,qwen1b}.sh` | 8×H200 exclusive sbatches, `grpocredit-verl-pinned` env, HF offline. |
 
 Both orchestrators support `--dry-run` for sanity-checking the work list before launching.

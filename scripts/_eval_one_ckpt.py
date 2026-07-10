@@ -15,9 +15,15 @@ Differences from upstream:
   * Emits a single JSON line to stdout in a delimited block so an orchestrator
     can subprocess this script without needing per-ckpt files.
 
-Grading parity: the math grader is `verl.utils.reward_score.math.compute_score`
-imported at runtime — identical to grpocredit so the SPO vs VoI/GRPO numbers
-are byte-comparable.
+Grading is selected by --grader (default 'verl' = UNCHANGED original behavior):
+  * verl (default) = `verl.utils.reward_score.math.compute_score` (Hendrycks
+    is_equiv) imported at runtime — identical to grpocredit so SPO vs VoI/GRPO
+    numbers are byte-comparable. This path (`_grade_verl_only`) is the original
+    code and the ONLY path the DeepSeekMath-7B eval uses.
+  * math_verify / both = SPO's PUBLISHED extractive_match grader (open-r1
+    `custom|math_500` config, in `_math_verify_grader.py`). Opted into only by
+    the R1-Distill-Qwen-1.5B orchestrator (`_grade_multi`); 'both' also records
+    the verl number under result["graders"]["verl"].
 """
 
 from __future__ import annotations
@@ -93,6 +99,20 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--tensor-parallel-size", type=int, default=8)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument(
+        "--grader",
+        choices=["verl", "math_verify", "both"],
+        default="verl",
+        help="Grader(s) to score with. DEFAULT 'verl' = the original Hendrycks "
+             "is_equiv path (unchanged behavior + output). 'math_verify' = SPO's "
+             "published extractive_match (open-r1 math_500 config); 'both' records "
+             "both (primary = math_verify). Only the Qwen-1.5B orchestrator opts in.",
+    )
+    ap.add_argument(
+        "--mv-precision", type=int, default=5,
+        help="float_rounding for the math_verify grader (open-r1 math_500 used 5). "
+             "Ignored when --grader verl.",
+    )
+    ap.add_argument(
         "--stop",
         action="append",
         default=None,
@@ -100,6 +120,178 @@ def parse_args() -> argparse.Namespace:
              "(SFT data is multi-problem-concatenated). Pass --stop '' to disable.",
     )
     return ap.parse_args()
+
+
+def _grade_verl_only(outputs, golds, args, ckpt, test, gen_seconds) -> dict:
+    """ORIGINAL grading path (verl Hendrycks is_equiv). Byte-identical to the
+    pre-grader-option behavior — used by the DeepSeekMath-7B eval and anyone not
+    opting into math_verify. Do not change without changing the 7B eval."""
+    per_q_pass1: list[float] = []
+    per_q_once_hit: list[float] = []
+    for q_idx, out in enumerate(outputs):
+        gold = golds[q_idx]
+        grading = [extract_and_grade_math(s.text, gold) for s in out.outputs]
+        per_q_pass1.append(sum(grading) / len(grading))
+        per_q_once_hit.append(1.0 if any(grading) else 0.0)
+
+    N = len(per_q_pass1)
+    n = args.n
+    p_arr = np.asarray(per_q_pass1)
+    se_cluster = float(np.std(p_arr, ddof=1) / np.sqrt(N)) if N > 1 else 0.0
+    se_bernoulli = float(np.sqrt((p_arr * (1 - p_arr)).mean() / (n * N)))
+    ci95 = float(1.96 * se_cluster)
+
+    result = {
+        "hf_ckpt": str(ckpt),
+        "test_parquet": str(test),
+        "dataset": args.dataset,
+        "n_questions": int(N),
+        "n_samples_per_question": int(n),
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "max_tokens": args.max_tokens,
+        "max_model_len": args.max_model_len,
+        "seed": args.seed,
+        "pass1": float(np.mean(per_q_pass1)),
+        "pass_at_n": float(np.mean(per_q_once_hit)),
+        "se_cluster": se_cluster,
+        "se_bernoulli": se_bernoulli,
+        "ci95": ci95,
+        "gen_seconds": gen_seconds,
+        "tensor_parallel_size": args.tensor_parallel_size,
+    }
+
+    print(
+        f"\n=== Result ===\n"
+        f"pass@1   = {result['pass1']:.4f} ± {ci95:.4f}  (95% CI, cluster SE; n={n}, N={N})\n"
+        f"pass@{n:<3} = {result['pass_at_n']:.4f}\n"
+        f"gen_seconds = {gen_seconds:.1f}\n"
+    )
+    return result
+
+
+def _grade_multi(outputs, golds, args, ckpt, test, gen_seconds) -> dict:
+    """math_verify (SPO extractive_match) grading, optionally alongside verl.
+
+    args.grader is 'math_verify' or 'both'. Primary metrics (top-level pass1/…)
+    come from math_verify; when 'both', verl numbers are recorded under
+    result["graders"]["verl"]. Only the Qwen-1.5B orchestrator selects this."""
+    n = args.n
+    N = len(outputs)
+
+    grader_configs: dict = {}
+    mv_grader = None
+    if args.grader in ("math_verify", "both"):
+        try:
+            from _math_verify_grader import MathVerifyGrader
+
+            mv_grader = MathVerifyGrader(precision=args.mv_precision)
+            grader_configs["math_verify"] = mv_grader.describe()
+        except Exception as e:
+            # grader==math_verify was explicitly requested -> hard fail; grader==both
+            # -> degrade gracefully to verl only (matches _math_verify_grader's
+            # "caller decides policy" and the --grader both docs).
+            if args.grader == "math_verify":
+                log.error("math_verify grader requested but unavailable: %s", e)
+                sys.exit(66)
+            log.warning("math_verify grader unavailable (%s) — scoring with verl only", e)
+    if args.grader == "both":
+        grader_configs["verl"] = {
+            "grader": "verl_hendrycks_is_equiv",
+            "engine": "verl.utils.reward_score.math.compute_score",
+            "note": "last-boxed extraction + strip_string + literal ==; no sympy",
+            "decision": "compute_score(text, gold) > 0.5",
+        }
+    active = list(grader_configs.keys())
+    primary = "math_verify" if "math_verify" in active else "verl"
+
+    # Pre-parse gold once per question for math_verify (reused across n samples).
+    mv_gold_parsed = None
+    mv_gold_fail = 0
+    if mv_grader is not None:
+        mv_gold_parsed = []
+        for g in golds:
+            gp = mv_grader.parse_gold(g)
+            if len(gp) == 0:
+                mv_gold_fail += 1
+            mv_gold_parsed.append(gp)
+        if mv_gold_fail:
+            log.warning(
+                "math_verify: %d/%d gold answers did not extract to sympy "
+                "(raw-string fallback used for those)", mv_gold_fail, N,
+            )
+
+    per_q = {name: {"pass1": [], "hit": []} for name in active}
+    t_grade = time.time()
+    for q_idx, out in enumerate(outputs):
+        gold = golds[q_idx]
+        texts = [s.text for s in out.outputs]
+        for name in active:
+            if name == "math_verify":
+                gp = mv_gold_parsed[q_idx]
+                grades = [mv_grader.grade(t, gold, gold_parsed=gp) for t in texts]
+            else:
+                grades = [extract_and_grade_math(t, gold) for t in texts]
+            per_q[name]["pass1"].append(sum(grades) / len(grades) if grades else 0.0)
+            per_q[name]["hit"].append(1.0 if any(grades) else 0.0)
+    grade_seconds = time.time() - t_grade
+
+    def _stats(pass1_list, hit_list):
+        p = np.asarray(pass1_list)
+        se_cluster = float(np.std(p, ddof=1) / np.sqrt(N)) if N > 1 else 0.0
+        se_bernoulli = float(np.sqrt((p * (1 - p)).mean() / (n * N))) if N > 0 else 0.0
+        return {
+            "pass1": float(np.mean(pass1_list)),
+            "pass_at_n": float(np.mean(hit_list)),
+            "se_cluster": se_cluster,
+            "se_bernoulli": se_bernoulli,
+            "ci95": float(1.96 * se_cluster),
+        }
+
+    graders_stats = {name: _stats(per_q[name]["pass1"], per_q[name]["hit"]) for name in active}
+    ps = graders_stats[primary]
+
+    result = {
+        "hf_ckpt": str(ckpt),
+        "test_parquet": str(test),
+        "dataset": args.dataset,
+        "n_questions": int(N),
+        "n_samples_per_question": int(n),
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "max_tokens": args.max_tokens,
+        "max_model_len": args.max_model_len,
+        "seed": args.seed,
+        "grader": primary,
+        "grader_mode": args.grader,
+        "pass1": ps["pass1"],
+        "pass_at_n": ps["pass_at_n"],
+        "se_cluster": ps["se_cluster"],
+        "se_bernoulli": ps["se_bernoulli"],
+        "ci95": ps["ci95"],
+        "graders": graders_stats,
+        "grader_configs": grader_configs,
+        "mv_gold_extract_failures": int(mv_gold_fail),
+        "mv_grade_errors": int(mv_grader.grade_errors) if mv_grader is not None else 0,
+        "gen_seconds": gen_seconds,
+        "grade_seconds": grade_seconds,
+        "tensor_parallel_size": args.tensor_parallel_size,
+    }
+
+    summary = "\n".join(
+        f"  {name:11s} pass@1={graders_stats[name]['pass1']:.4f} "
+        f"± {graders_stats[name]['ci95']:.4f}   pass@{n}={graders_stats[name]['pass_at_n']:.4f}"
+        + ("   [PRIMARY]" if name == primary else "")
+        for name in active
+    )
+    print(
+        f"\n=== Result ({args.dataset}, n={n}, N={N}) ===\n"
+        f"{summary}\n"
+        f"gen_seconds = {gen_seconds:.1f}  grade_seconds = {grade_seconds:.1f}\n"
+    )
+    return result
 
 
 def main() -> None:
@@ -190,48 +382,13 @@ def main() -> None:
     outputs = llm.generate(prompts, sp)
     gen_seconds = time.time() - t0
 
-    per_q_pass1: list[float] = []
-    per_q_once_hit: list[float] = []
-    for q_idx, out in enumerate(outputs):
-        gold = golds[q_idx]
-        grading = [extract_and_grade_math(s.text, gold) for s in out.outputs]
-        per_q_pass1.append(sum(grading) / len(grading))
-        per_q_once_hit.append(1.0 if any(grading) else 0.0)
-
-    N = len(per_q_pass1)
-    n = args.n
-    p_arr = np.asarray(per_q_pass1)
-    se_cluster = float(np.std(p_arr, ddof=1) / np.sqrt(N)) if N > 1 else 0.0
-    se_bernoulli = float(np.sqrt((p_arr * (1 - p_arr)).mean() / (n * N)))
-    ci95 = float(1.96 * se_cluster)
-
-    result = {
-        "hf_ckpt": str(ckpt),
-        "test_parquet": str(test),
-        "dataset": args.dataset,
-        "n_questions": int(N),
-        "n_samples_per_question": int(n),
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "top_k": args.top_k,
-        "max_tokens": args.max_tokens,
-        "max_model_len": args.max_model_len,
-        "seed": args.seed,
-        "pass1": float(np.mean(per_q_pass1)),
-        "pass_at_n": float(np.mean(per_q_once_hit)),
-        "se_cluster": se_cluster,
-        "se_bernoulli": se_bernoulli,
-        "ci95": ci95,
-        "gen_seconds": gen_seconds,
-        "tensor_parallel_size": args.tensor_parallel_size,
-    }
-
-    print(
-        f"\n=== Result ===\n"
-        f"pass@1   = {result['pass1']:.4f} ± {ci95:.4f}  (95% CI, cluster SE; n={n}, N={N})\n"
-        f"pass@{n:<3} = {result['pass_at_n']:.4f}\n"
-        f"gen_seconds = {gen_seconds:.1f}\n"
-    )
+    # --grader verl (default) is the ORIGINAL code path, byte-identical output.
+    # math_verify / both add SPO's published extractive_match grader; only the
+    # Qwen-1.5B orchestrator opts in, so the 7B eval is unaffected.
+    if args.grader == "verl":
+        result = _grade_verl_only(outputs, golds, args, ckpt, test, gen_seconds)
+    else:
+        result = _grade_multi(outputs, golds, args, ckpt, test, gen_seconds)
 
     print("===RESULT_JSON_BEGIN===")
     print(json.dumps(result))

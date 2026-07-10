@@ -43,10 +43,12 @@ echo "[eval-qwen1b] git HEAD: $(git rev-parse HEAD)"
 echo "[eval-qwen1b] orchestrator SHA: $(sha1sum scripts/eval_spo_qwen1b.py | awk '{print $1}')"
 echo "[eval-qwen1b] eval-one-ckpt SHA: $(sha1sum scripts/_eval_one_ckpt.py | awk '{print $1}')"
 
-# Build the Qwen-templated parquets if they don't exist (idempotent).
-if [ ! -f data/verl_qwen/math_v2_test.parquet ]; then
-    echo "[eval-qwen1b] Building Qwen-templated parquets ..."
-    python scripts/build_qwen_templated_parquets.py
-fi
+# Build/refresh the Qwen-templated parquets. The build script is idempotent and
+# version-aware (a .template_version marker written only after all four succeed), so
+# it rebuilds when missing/partial/stale — e.g. bos-v1 parquets that erroneously
+# embedded a literal <｜begin▁of▁sentence｜> (vLLM already auto-prepends the BOS, so it
+# doubled; reverted in nobos-v2) — and is a fast no-op when already up to date.
+echo "[eval-qwen1b] Ensuring Qwen-templated parquets are current ..."
+python scripts/build_qwen_templated_parquets.py
 
 python scripts/eval_spo_qwen1b.py
